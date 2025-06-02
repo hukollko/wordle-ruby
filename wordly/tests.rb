@@ -1,86 +1,92 @@
+# tests.rb
 
 # frozen_string_literal: true
-
 require "open3"
 
-# Создаем потокобезопасную очередь для каждого слова из словаря.
+# Устанавливаем кодировку по умолчанию (особенно важно на Windows)
+Encoding.default_external = Encoding::UTF_8
+Encoding.default_internal = Encoding::UTF_8
+
 queue = Queue.new
-File.foreach("5lenwords_russian_base.txt", chomp: true) { |word| queue << word }
 
-# Создаем хэш, значением по умолчанию для любого нового ключа является 0.
-# Мы будем использовать это, чтобы отслеживать, сколько попыток потребовалось, чтобы успешно дойти до финального слова.
-results = Hash.new { 0 }
+# Читаем все слова из словаря (UTF-8)
+File.foreach("5lenwords_russian_base.txt", chomp: true, encoding: "UTF-8") do |w|
+  word = w.strip.force_encoding("UTF-8")
+  queue << word unless word.empty?
+end
 
-# Создаем список рабочих потоков, которые будут извлекать слова из словаря,
-# пока все они не будут исчерпаны.
-workers =
-  8.times.map do
-    Thread.new do
-      until queue.empty?
-        word = queue.shift
-        guesses = 0
+results = Hash.new(0)
 
-        # Открываем новый ruby-процесс, выполняющий файл wordle.rb. Внутри
-        # блока вы можете писать в STDIN и читать из STDOUT IO объектов
-        # для взаимодействия с дочерним процессом.
-        Open3.popen2("ruby wordle.rb") do |stdin, stdout, waiter|
-          # Протокол немного расплывчат, но в основном, если вы доходите до
-          # финального слова, он выводит "Загаданное слово:", поэтому мы можем
-          # использовать это как условие цикла.
-          until (read = stdout.read(3)) == "Загаданное"
-            guesses += 1
+workers = 8.times.map do
+  Thread.new do
+    until queue.empty?
+      word = queue.shift
+      guesses = 0
 
-            # Читаем остаток предположения, а затем пропускаем приглашение в
-            # STDOUT пайпе.
-            guess = "#{read}#{stdout.read(2)}"
-            stdout.read(10)
+      Open3.popen2("ruby wordly.rb") do |stdin, stdout, _waiter|
+        loop do
+          raw = stdout.read(3)
+          break if raw.nil?
 
-            # Создаем ввод, необходимый для того, чтобы сообщить дочернему
-            # процессу, какие плитки стали какими цветами. Это аналогично
-            # вводу предполагаемого слова в текстовое поле.
-            chars =
-              guess.each_char.map.with_index do |char, index|
-                if word[index] == char
-                  "p"
-                elsif word.include?(char)
-                  ";"
-                else
-                  "_"
-                end
-              end
-
-            # Записываем ввод в STDIN и отправляем его по пайпу, чтобы дочерний
-            # процесс разблокировал свое чтение.
-            stdin.write("#{chars.join}\n")
-            stdin.flush
+          read = raw.force_encoding("UTF-8")
+          if read == "Заг"
+            # дочитать остаток "аданное"
+            stdout.read(7)
+            break
           end
 
-          # Как только мы сюда доберемся, он начнет печатать "Загаданное слово:",
-          # поэтому читаем остаток и затем проверяем, что он выбрал
-          # правильное слово.
+          guesses += 1
+
+          part = stdout.read(2)
+          part = "" if part.nil?
+          guess = "#{read}#{part.force_encoding("UTF-8")}"
+
           stdout.read(10)
-          raise if stdout.read(5) != word
+
+          guess.force_encoding("UTF-8")
+          word_utf8 = word.force_encoding("UTF-8")
+
+          feedback_chars = guess.each_char.map.with_index do |ch, idx|
+            c = ch.force_encoding("UTF-8")
+            if word_utf8[idx] == c
+              "з"
+            elsif word_utf8.include?(c)
+              "ж"
+            else
+              "_"
+            end
+          end
+
+          begin
+            stdin.write(feedback_chars.join + "\n")
+            stdin.flush
+          rescue Errno::EPIPE
+            # Дочерний процесс закрыл STDIN (игра уже завершилась) — прерываем цикл
+            break
+          end
         end
 
-        results[guesses] += 1
+        final_line = stdout.gets&.force_encoding("UTF-8")
+        unless final_line && final_line.start_with?("Загаданное слово:")
+          raise "Ожидалось «Загаданное слово: …», получили: #{final_line.inspect}"
+        end
+
+        guessed = final_line.split(":", 2)[1].strip
+        unless guessed == word
+          raise "Игра угадала «#{guessed}», а должна была «#{word}»"
+        end
       end
+
+      results[guesses] += 1
     end
   end
+end
 
-# Присоединяем каждый рабочий поток обратно к основному потоку, чтобы
-# убедиться, что мы дождемся завершения всего.
-workers.map(&:join)
+workers.each(&:join)
 
-# Выводим окончательные результаты, которые показывают, сколько попыток
-# потребовалось, чтобы добраться до каждого слова. В идеале все числа
-# должны быть 5 или меньше (количество фактических попыток, которые вы получаете).
+puts "Результаты (сколько слов угадано за N попыток):"
 p results.sort.to_h
 
-# Получаем оценку результатов, которая составляет 10 баллов за каждое
-# слово, угаданное за 3 попытки, 5 баллов за каждое слово, угаданное за
-# 6 попыток, и 0 баллов за все остальные слова.
-score =
-  (results[1] + results[2] + results[3]) * 10 +
-    (results[4] + results[5] + results[6]) * 5
-
-p score
+score = (results[1] + results[2] + results[3]) * 10 +
+  (results[4] + results[5] + results[6]) * 5
+puts "Итоговый score: #{score}"
